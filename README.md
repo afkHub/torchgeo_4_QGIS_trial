@@ -1,0 +1,1 @@
+# torchgeo_4_QGIS_trial
