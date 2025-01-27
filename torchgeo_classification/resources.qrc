@@ -1,0 +1,7 @@
+<RCC>
+  <qresource prefix="/plugins/torchgeo_classification">
+    <file>torchgeo_logo.png</file>
+    <file>tum_logo.png</file>
+    <file>icon1.png</file>
+  </qresource>
+</RCC>
