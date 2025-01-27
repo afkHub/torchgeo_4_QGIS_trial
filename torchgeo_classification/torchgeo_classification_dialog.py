@@ -28,6 +28,15 @@ from qgis.PyQt import uic
 from qgis.PyQt import QtWidgets
 
 
+import rasterio
+import numpy as np
+import torch
+from torch import nn
+from torchgeo.models import resnet18
+import time
+from rasterio.windows import Window
+
+
 # This loads your .ui file so that PyQt can populate your plugin with the elements from Qt Designer
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
     os.path.dirname(__file__), 'torchgeo_classification_dialog_base.ui'))
@@ -46,3 +55,225 @@ class TorchgeoClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         # Connect classify button
         self.processButton.clicked.connect(self.run_classification)
+
+    def setup_ui(self):
+        self.mQgsFileWidget.setFilter(QgsFileWidget.Filter.Directory) #for selecting a folder instead of a file
+        self.mQgsFileWidget.setStorageMode(QgsFileWidget.Directory) #for selecting a folder instead of a file
+
+    def run_classification(self):
+        # Retrieve input values from GUI
+        base_folder = self.mQgsFileWidget.filePath() #base folder containing Sentinel-2 data
+        model_root = self.mQgsFileWidget_2.filePath()
+        subset_size = self.spinBox.value()
+        patch_size = self.spinBox_2.value()
+        stride = self.spinBox_3.value()
+        classified_file_name = self.lineEdit.text()
+
+        # Validate inputs with warnings
+        if not base_folder or not os.path.isdir(base_folder):
+            QtWidgets.QMessageBox.warning(self, "Error", "Invalid base folder!")
+            return
+        if not model_root or not os.path.isfile(model_root):
+            QtWidgets.QMessageBox.warning(self, "Error", "Invalid model file!")
+            return
+        if not classified_file_name:
+            QtWidgets.QMessageBox.warning(self, "Error", "Please specify the classified file name!")
+            return
+
+        # Saving path for 13 layered merged Sentinel-2 image
+        output_file = os.path.join(base_folder, "sentinel2_allBands.tif")
+        classified_file = os.path.join(base_folder, classified_file_name)
+
+        
+        if not os.path.exists(output_file): #check if output_file already exists to reduce the processing time
+            # Step 1: Define Sentinel-2 band resolutions
+            sentinel2_band_resolutions = {
+                "R10m": ["B02", "B03", "B04", "B08"],
+                "R20m": ["B05", "B06", "B07", "B8A", "B11", "B12"],
+                "R60m": ["AOT", "SCL", "WVP"]
+            }
+            sentinel2_files = self.list_sentinel2_files(base_folder, sentinel2_band_resolutions)
+
+            # Step 2: Load bands
+            bands, metadata_list = self.load_bands(sentinel2_files)
+            if not bands:
+                QtWidgets.QMessageBox.warning(self, "Error", "No valid bands found!")
+                return
+
+            # Save as multi-layer GeoTIFF
+            self.save_as_multiband_geotiff(output_file, bands, metadata_list)
+            print(f"13 bands were merged and {output_file} file was created.")
+
+        else:
+            print(f"File {output_file} already exists. Skipping band merging step.")
+
+
+        # Step 3: Load model
+        model = self.load_model(model_root)
+
+        # Step 4: Perform classification
+        self.perform_classification(output_file, model, subset_size, patch_size, stride, classified_file)
+
+        QtWidgets.QMessageBox.information(self, "Success", f"Classified file saved at {classified_file}")
+    
+    # Function to list available Sentinel-2 data
+    def list_sentinel2_files(self, base_folder, band_names):
+        sentinel2_files = {}
+        for res, bands in band_names.items():
+            resolution_folder = os.path.join(base_folder, res)
+            if not os.path.exists(resolution_folder):
+                continue
+            for file in os.listdir(resolution_folder):
+                # Skip non-raster files
+                if not file.endswith(('.tif', '.jp2')): #check for valid raster extensions
+                    continue
+                for band in bands:
+                    if band in file:
+                        sentinel2_files.setdefault(res, []).append(os.path.join(resolution_folder, file))
+        return sentinel2_files
+
+    # Function to load bands and metadata
+    def load_bands(self, file_dict):
+        bands = []
+        metadata_list = []
+        for res, files in file_dict.items():
+            for file_path in files:
+                try:
+                    # Open only valid raster files
+                    if not file_path.endswith(('.tif', '.jp2')):
+                        print(f"Skipping non-raster file: {file_path}")
+                        continue
+                    with rasterio.open(file_path) as src:
+                        band_data = src.read(1)  #read the first (and only) band
+                        bands.append(band_data)
+                        metadata_list.append({
+                            "file": file_path,
+                            "transform": src.transform,
+                            "crs": src.crs,
+                            "height": src.height,
+                            "width": src.width,
+                            "dtype": band_data.dtype
+                        })
+                except rasterio.errors.RasterioIOError as e:
+                    print(f"Error reading {file_path}: {e}")
+        return bands, metadata_list
+
+    # Function to save all bands as a multi-layer GeoTIFF
+    def save_as_multiband_geotiff(self, output_path, bands, metadata_list):
+        if not bands:
+            return
+        meta = metadata_list[0].copy()
+        meta.update({"count": len(bands), "driver": "GTiff", "dtype": "uint16"})
+        with rasterio.open(output_path, "w", **meta) as dst:
+            for i, band in enumerate(bands):
+                dst.write(band, i + 1)
+
+    # Function to load Resnet18 model
+    def load_model(self, model_root):
+        model = resnet18(pretrained=False)
+        model.conv1 = nn.Conv2d(13, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        model.fc = nn.Linear(model.fc.in_features, 10) # 10 classes for EuroSAT, load full model for other datasets
+        model.load_state_dict(torch.load(model_root))
+        model.eval()
+        return model
+
+    # Function to perform patch classification
+    def perform_classification(self, output_file, model, subset_size, patch_size, stride, classified_file):
+        # Open the GeoTIFF file and read all bands
+        with rasterio.open(output_file) as src:
+            sentinel2_img = src.read() #read all bands as a numpy array (shape: [bands, height, width])
+        
+        # Extract a subset from the center of the image
+        h, w = sentinel2_img.shape[1], sentinel2_img.shape[2]
+        center_x, center_y = w // 2, h // 2
+        half_size = subset_size // 2
+
+        # Subset the image
+        subset_img = sentinel2_img[:, center_y-half_size:center_y+half_size, center_x-half_size:center_x+half_size] #shape: (bands, subset_size, subset_size)
+
+        # Update dimensions for the subset
+        h, w = subset_img.shape[1], subset_img.shape[2]
+        output_classes = np.zeros((h, w), dtype=np.uint8)  #initialize classification output for the subset
+
+        # Calculate the total steps for progress tracking based on the subset
+        total_steps = (h // patch_size) * (w // patch_size)
+        step_count = 0
+        start_time = time.time()  #reset timer
+
+        
+        for i in range(0, h - patch_size + 1, stride):
+            for j in range(0, w - patch_size + 1, stride):
+                # Extract patch
+                patch = subset_img[:, i:i+patch_size, j:j+patch_size] #extract (patch size)x(patch size) patches
+                patch = patch.astype(np.float32)  #convert the patch to img format- suitable for the model
+                input_tensor = torch.from_numpy(patch).unsqueeze(0) #transform the img into a tensor
+                input_tensor = (input_tensor - 0.5) / 0.5  #match training normalization
+
+                with torch.no_grad():
+                    output = model(input_tensor) #to get the output predictions
+                    _, predicted = torch.max(output, 1) #the highest predicted probability
+
+                #assign the classification result to the corresponding patch area
+                output_classes[i:i+patch_size, j:j+patch_size] = predicted.item()
+                    
+                # timing - update and print progress
+                step_count += 1
+                if step_count % 100 == 0 or step_count == total_steps: #print every 100 steps or at the end
+                    elapsed_time = time.time() - start_time
+                    
+                    remaining_steps = total_steps - step_count
+                    time_per_step = elapsed_time / step_count
+                    remaining_time = remaining_steps * time_per_step
+                    
+                    print(f"Progress: {step_count}/{total_steps} - Elapsed: {elapsed_time:.2f}s - Remaining: {remaining_time:.2f}s", end="\r")
+
+
+        # Calculating class percentages
+        class_names = [
+            "AnnualCrop", "Forest", "HerbaceousVegetation", "Highway", "Industrial",
+            "Pasture", "PermanentCrop", "Residential", "River", "SeaLake"
+        ]
+        #calculate unique classes and the number of each
+        unique_classes, class_counts = np.unique(output_classes, return_counts=True)
+        #take total pixel number
+        total_pixels = output_classes.size
+        class_percentages = {cls: 0.0 for cls in range(len(class_names))}
+        #calculate percantage of each classes
+        percentages = (class_counts / total_pixels) * 100 #create a dictionary to hold percentages for all classes
+        #fill in the percentages for the classes that exist
+        for cls, count in zip(unique_classes, class_counts):
+            class_percentages[cls] = (count / total_pixels) * 100
+        #print the results, including classes with 0%
+        for cls, pct in class_percentages.items():
+            class_name = class_names[cls] #reach the class name
+            print(f"Class {cls} ({class_name}): {pct:.2f}%")
+
+        # Get the geoinformation from the sentinel2 data
+        with rasterio.open(output_file) as src:
+            transform = src.transform
+            crs = src.crs
+
+        # Adjust the transform to match the subset area
+        subset_transform = rasterio.windows.transform(
+            rasterio.windows.Window(center_x - half_size, center_y - half_size, subset_size, subset_size),
+            src.transform)
+        
+        # Save the classified subset as a GeoTIFF
+        with rasterio.open(
+            classified_file,
+            "w",
+            driver="GTiff",
+            height=output_classes.shape[0],
+            width=output_classes.shape[1],
+            count=1,  #single band for classification
+            dtype=np.uint8,
+            crs=crs,
+            transform=subset_transform,
+        ) as dst:
+            dst.write(output_classes, 1)  #write the classification layer
+
+            #add metadata too, to keep the number of classes info (10) even if there is a class with 0%
+            dst.update_tags(
+                CLASS_NAMES=",".join(class_names)  #add class names to the metadata
+            )
+        print(f"Classified subset saved as {classified_file}")
